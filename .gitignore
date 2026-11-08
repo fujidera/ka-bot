@@ -1,0 +1,20 @@
+# секреты
+.env
+.env.*
+!.env.example
+
+# логи и зашифрованные куки
+logs/
+*.enc
+*.meta.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ide/os
+.idea/
+.vscode/
+.DS_Store
